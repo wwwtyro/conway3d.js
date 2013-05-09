@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+
+<html>
+
+    <head>
+
+        <script src="jquery.min.js"></script>
+        <script src='dat.gui.min.js'></script>
+        <script src="three58.js"></script>
+        <script src="trackball.js"></script>
+
+        <script>
+
+            "use strict";
+
+            var scene,
+                camera,
+                renderer,
+                particles,
+                material,
+                worker,
+                updateQueue = [],
+                waiting = false,
+                trackball,
+                controls,
+                gui,
+                generation = 0,
+                canvas,
+                zoom = {current: 1.0, target: 1.5},
+                particleSystem;
+
+            $(function() {
+
+                controls = new Controls();
+                controls.writeHash();
+                gui = new dat.GUI();
+                gui.addColor(controls, 'foreground').name('Foreground').onChange(function(value) {
+                    particleSystem.material.color.r = value[0]/255;
+                    particleSystem.material.color.g = value[1]/255;
+                    particleSystem.material.color.b = value[2]/255;
+                    controls.writeHash();
+                });
+                gui.addColor(controls, 'background').name('Background').onChange(function(value) {
+                    var color = new THREE.Color();
+                    color.r = value[0]/255;
+                    color.g = value[1]/255;
+                    color.b = value[2]/255;
+                    renderer.setClearColor(color);
+                    controls.writeHash();
+                });
+                gui.add(controls, 'resolution', 0, 1).name("Resolution").onFinishChange(function(value) {
+                    renderer.setSize(window.innerWidth * controls.resolution, window.innerHeight * controls.resolution);
+                    controls.writeHash();
+                });
+                gui.add(controls, 'size', 1, 32).name("Particle Size").step(1).onChange(function() {
+                    controls.writeHash();
+                });
+                gui.add(controls, 'opacity', 0, 1).name("Particle Opacity").onChange(function() {
+                    controls.writeHash();
+                });
+                gui.add(controls, 'speed', 0, 2500).name("Simulation Speed").step(1).onChange(function() {
+                    controls.writeHash();
+                });
+                gui.add(controls, 'simsize', 8, 128).name("Simulation Size").step(1).onFinishChange(function(value) {
+                    initializeField();
+                    controls.writeHash();
+                });
+                gui.add(controls, 'lonely', 0, 26).name("Lonely").step(1).onFinishChange(function() {
+                    initializeField();
+                    controls.writeHash();
+                });
+                gui.add(controls, 'crowded', 0, 26).name("Crowded").step(1).onFinishChange(function() {
+                    initializeField();
+                    controls.writeHash();
+                });
+                gui.add(controls, 'reset').name("Reset Simulation");
+                gui.generation = gui.add(controls, 'generation').name("Generation 0");
+
+                camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 1, 1000);
+                camera.position.set(0,0,controls.simsize);
+                camera.lookAt(new THREE.Vector3(0,0,0));
+
+                material = new THREE.ParticleBasicMaterial({map: THREE.ImageUtils.loadTexture("particle.png"),
+                                                            color: 0xffd100,
+                                                            size: 8, 
+                                                            opacity: 0.01, 
+                                                            transparent: true, 
+                                                            blending: THREE.AdditiveBlending,
+                                                            depthTest: false});
+
+                canvas = document.getElementById('conway');
+                canvas.onselectstart = function () { return false; }
+                renderer = new THREE.WebGLRenderer({antialias: false, canvas: canvas});
+                renderer.setSize(window.innerWidth * controls.resolution, window.innerHeight * controls.resolution);
+                var color = new THREE.Color();
+                color.r = controls.background[0]/255;
+                color.g = controls.background[1]/255;
+                color.b = controls.background[2]/255;
+                renderer.setClearColor(color);
+
+                initializeField();
+
+                window.addEventListener('DOMMouseScroll', onMouseWheel, false);
+                window.addEventListener('mousewheel', onMouseWheel, false);
+
+                animate();
+            });
+
+
+            var Controls = function() {
+                var hash = {};
+                try {
+                    hash = JSON.parse(window.location.hash.replace("#",""));
+                }
+                catch (err) {
+                    console.warn("Failed to parse json in window.location.hash");
+                }
+                this.foreground = hash.foreground || [255,255,255];
+                this.background = hash.background || [99,99,255];
+                this.resolution = hash.resolution || 0.25;
+                this.opacity = hash.opacity || 0.01;
+                this.size = hash.size || 8;
+                this.speed = hash.speed || 200;
+                this.simsize = hash.simsize || 64;
+                this.lonely = hash.lonely || 4;
+                this.crowded = hash.crowded || 14;
+                this.reset = initializeField;
+                this.generation = function() {};
+
+                this.writeHash = function() {
+                    var hash = { foreground: this.foreground, 
+                                 background: this.background,
+                                 resolution: this.resolution, 
+                                 opacity: this.opacity,
+                                 size: this.size,
+                                 speed: this.speed,
+                                 lonely: this.lonely,
+                                 crowded: this.crowded,
+                                 simsize: this.simsize }
+                    window.location.hash = JSON.stringify(hash);
+                }
+
+            }
+
+
+            function initializeField() {
+                particles = new THREE.BufferGeometry();
+                particles.dynamic = true;
+                particles.attributes = {
+                    position : {
+                        itemSize: 3,
+                        array: new Float32Array(controls.simsize*controls.simsize*controls.simsize*3),
+                        numItems: controls.simsize*controls.simsize*controls.simsize*3
+                    }
+                }
+                var positions = particles.attributes.position.array;
+                for (var p = 0; p < positions.length*3; p++) {
+                    positions[p] = 1e38;
+                }
+
+                particles.computeBoundingSphere();
+
+                particleSystem = new THREE.ParticleSystem(particles, material);
+                particleSystem.material.color.r = controls.foreground[0]/255;
+                particleSystem.material.color.g = controls.foreground[1]/255;
+                particleSystem.material.color.b = controls.foreground[2]/255;
+                particleSystem.sortParticles = false;
+
+                if (worker != undefined) {
+                    worker.terminate();
+                }
+
+                generation = 0;
+                worker = new Worker("worker.js");
+                worker.addEventListener('message', queue);
+                worker.postMessage({cmd: 'initialize', size: controls.simsize, lonely: controls.lonely, crowded: controls.crowded});
+                worker.postMessage({cmd: 'next'});
+                updateQueue = [];
+
+                scene = new THREE.Scene();
+                scene.add(particleSystem);
+
+                trackball = new Trackball(canvas, particleSystem);
+            }
+
+
+            function queue(e) {
+                updateQueue = updateQueue.concat(e.data);
+                generation += 1;
+                gui.generation.name("Generation " + generation);
+                waiting = false;
+            }
+
+
+            function animate() {
+                requestAnimationFrame(animate);
+                updateField();
+                if (!trackball.mouseDown) {
+                    trackball.rotate(0.0025, 0.0001);
+                }
+                zoom.current += 0.25 * (zoom.target - zoom.current);
+                camera.position.set(0,0,controls.simsize*zoom.current);
+                renderer.render(scene, camera);
+            }
+
+
+            function updateField() {
+                material.size = controls.size;
+                material.opacity = controls.opacity;
+                var positions = particles.attributes.position.array;
+                var count = Math.min(controls.speed*4, updateQueue.length);
+                var u = updateQueue.splice(0, count);
+                for (var i = 0; i < u.length; i+=4) {
+                    var x  = u[i + 0];
+                    var y  = u[i + 1];
+                    var z  = u[i + 2];
+                    var on = u[i + 3];
+                    var pindex = (x*controls.simsize*controls.simsize + y*controls.simsize + z) * 3;
+                    if (on) {
+                        positions[pindex + 0] = x-controls.simsize/2;
+                        positions[pindex + 1] = y-controls.simsize/2;
+                        positions[pindex + 2] = z-controls.simsize/2;
+                    }
+                    else {
+                        positions[pindex + 0] = 1e38;
+                        positions[pindex + 1] = 1e38;
+                        positions[pindex + 2] = 1e38;
+                    }
+                }
+                if(updateQueue.length < 10000 && !waiting) {
+                    worker.postMessage({cmd: 'next'})
+                    waiting = true;
+                }
+                particles.attributes.position.needsUpdate = true;
+            }
+
+
+            function onMouseWheel(e) {
+                var delta = 0;
+                if(e.wheelDelta) { delta = e.wheelDelta };
+                if(e.detail) { delta = -e.detail };
+                if (delta < 0) { 
+                    zoom.target *= 1.1; 
+                } else { 
+                    zoom.target *= 0.9; 
+                }
+            }
+
+
+        </script>
+
+        <style>
+
+            html, body {
+                margin: 0px;
+                padding: 0px;
+                width:100%;
+                height:100%;
+            }
+
+            canvas {
+                cursor: pointer;
+            }
+
+            #generation {
+                color: white;
+                font-size: 32px;
+                position: fixed;
+                bottom: 8px;
+                left: 8px;
+            }
+
+        </style>
+
+    </head>
+
+    <body>
+
+        <canvas style="width:100%;height:100%;position:fixed;top:0;left:0" id='conway'></canvas>
+        <div id="generation"></div>
+        <iframe src="http://wwwtyro.github.io/career/hireme/" style="position: fixed; right: 15px; bottom: 15px; border:none; width: 102px; height: 102px"></iframe>
+    </body>
+
+</html>
+
+<script>
+
