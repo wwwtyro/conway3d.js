@@ -110,7 +110,8 @@
             var Controls = function() {
                 var hash = {};
                 try {
-                    hash = JSON.parse(window.location.hash.replace("#",""));
+                    var hash = decodeURIComponent(window.location.hash);
+                    hash = JSON.parse(hash.replace("#",""));
                 }
                 catch (err) {
                     console.warn("Failed to parse json in window.location.hash");
